@@ -1,0 +1,709 @@
+// Rentre — Postgres schema (Supabase).
+// Field types and enum values are taken from server/lib/schemas.ts (zod), server/lib/store.ts
+// (the JSON store this replaces) and the V4 UI flows in src/app/SharedPackageScreen.tsx.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  TENANT
+  LANDLORD
+  REALTOR
+}
+
+enum ApplicationStatus {
+  REVIEWING
+  INTERVIEW
+  APPROVED
+  DECLINED
+  WITHDRAWN
+}
+
+enum ScreeningStep {
+  REFERENCE
+  INTERVIEW
+  REPORT
+}
+
+enum ScreeningCheckStatus {
+  CALLING
+  DONE
+  FAILED
+  // Reference-call outcomes (question-bank flow). COMPLETED replaces DONE for reference checks;
+  // DECLINED = the reference refused the call; UNREACHABLE = no answer after two retries.
+  COMPLETED
+  UNREACHABLE
+  DECLINED
+}
+
+enum LeadIntent {
+  SAVE_REPORT
+  RENT_ALERTS
+  RENEWAL_TIPS
+}
+
+/// Who a lease revision is waiting on, and how it ended. A lease is agreed when no revision is
+/// PROPOSED — a lease that never had one is agreed from the start, which is the pre-revision flow.
+enum LeaseRevisionStatus {
+  PROPOSED
+  ACCEPTED
+  REJECTED
+  WITHDRAWN
+}
+
+enum LeaseRevisionParty {
+  LANDLORD
+  TENANT
+}
+
+/// What a notification is about. The bell reads these; email goes out at write time.
+enum NotificationKind {
+  VACANCY_MATCH
+  LEASE_REVISION
+  APPLICATION_STATUS
+}
+
+/// Vendor-backed profile sections (credit, background, identity) in routes/profile.ts:
+/// consent alone yields PENDING; only a provider callback may set VERIFIED.
+enum VerificationStatus {
+  NOT_STARTED
+  PENDING
+  VERIFIED
+}
+
+/// Proof a landlord uploads to unlock a shared passport (V4 OwnershipVerifyStep).
+enum OwnershipProofType {
+  PROPERTY_TAX_BILL
+  UTILITY_BILL
+}
+
+/// Paid add-ons a landlord orders from a shared passport (V4 SERVICE_ADDONS).
+enum ServiceAddon {
+  REFERENCE_CALL          // $50 per call, transcript included
+  LOCKBOX                 // $375 one-time, hardware kept
+  LEASE_SIGNING           // $8.99/month while active
+  RENT_BACK               // 10% of first month; requires LEASE_SIGNING
+  THIRD_PARTY_SCREENING   // $25 pass-through (SingleKey / Equifax)
+}
+
+enum AddonRequestKind {
+  SERVICES
+  DOCUMENTS
+  VIEWING
+}
+
+enum AddonRequestStatus {
+  REQUESTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+/// Uploaded or requested files. V4 ADDON_OPTIONS plus the ownership-proof and screening docs.
+enum DocumentKind {
+  PAYSTUBS
+  BANK_STATEMENT
+  EMPLOYMENT_LETTER
+  NOTICE_OF_ASSESSMENT
+  REFERENCE_LETTER
+  GOVERNMENT_ID
+  CREDIT_REPORT
+  INCOME_PROOF
+  PROPERTY_TAX_BILL
+  UTILITY_BILL
+  LEASE_FILE
+}
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  name         String
+  role         UserRole
+  /// Null for passwordless (emailed code) accounts — see routes/auth.ts.
+  passwordHash String?
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @db.Timestamptz(6)
+  /// Soft delete: leases and signatures must survive account closure for their legal life.
+  deletedAt    DateTime? @db.Timestamptz(6)
+
+  listings          Listing[]
+  applications      Application[]
+  profile           TenantProfile?
+  sharedPassports   SharedPassport[]
+  leasesAsLandlord  Lease[]          @relation("LandlordLeases")
+  leasesAsTenant    Lease[]          @relation("TenantLeases")
+  documents         Document[]
+  passportAccesses  PassportAccess[]
+  addonRequests     AddonRequest[]
+  customQuestions   CustomQuestion[]
+  rentRollEntries   RentRollEntry[]
+  savedBuildings    SavedBuilding[]
+  notifications     Notification[]
+
+  @@index([role])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+/// Emailed one-time sign-in codes. store.ts kept these in a process-local Map with a note to
+/// move them here once the API runs more than one process; Supabase pooling makes that true.
+/// Emailed one-time sign-in codes. Kept here rather than in a process-local Map so pending codes
+/// survive a restart and are shared when the API runs more than one process.
+model OtpCode {
+  id         String    @id @default(uuid()) @db.Uuid
+  email      String
+  /// SHA-256 of the 6-digit code — never the code itself.
+  codeHash   String
+  name       String?
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @db.Timestamptz(6)
+  sentAt     DateTime  @default(now()) @db.Timestamptz(6)
+  consumedAt DateTime? @db.Timestamptz(6)
+
+  @@unique([email])
+  @@index([expiresAt])
+  @@map("otp_codes")
+}
+
+// ─── Listings ────────────────────────────────────────────────────────────────
+
+model Listing {
+  id            String   @id @default(uuid()) @db.Uuid
+  ownerId       String?  @db.Uuid
+  address       String
+  unit          String?
+  neighbourhood String
+  city          String
+  /// Monthly asking rent in CAD. Integer cents would be safer, but every rent in the codebase
+  /// is whole dollars and the zod schema caps at 1e6; Decimal(10,2) keeps it exact either way.
+  price         Decimal  @db.Decimal(10, 2)
+  unitType      String
+  bedrooms      Int
+  /// Half-baths exist, so this is not an Int (zod allows 0–20 fractional).
+  bathrooms     Decimal  @db.Decimal(3, 1)
+  sqft          Int
+  yearBuilt     Int
+  rentControlled Boolean
+  /// Free text in the UI ("Aug 1, 2025"), not a date — kept as typed.
+  moveIn        String
+  leaseTerm     String
+  image         String
+  photos        String[]
+  floorPlan     String   @default("")
+  /// Denormalized landlord display name; routes/listings.ts fills it at create time.
+  landlord      String
+  /// [{ label, price: number | "included", mandatory? }]
+  addOns        Json     @default("[]")
+  /// { price, location, transit, walkability, amenities, space } — each 0–10.
+  scores        Json
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(6)
+  /// Soft delete: DELETE /listings/:id must not orphan existing applications.
+  deletedAt     DateTime? @db.Timestamptz(6)
+
+  owner        User?         @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  applications Application[]
+  rentRoll     RentRollEntry[]
+  savedBy      SavedBuilding[]
+
+  @@index([city, price])
+  @@index([ownerId])
+  @@index([createdAt])
+  @@index([deletedAt])
+  @@map("listings")
+}
+
+// ─── Applications & screening ────────────────────────────────────────────────
+
+model Application {
+  id            String            @id @default(uuid()) @db.Uuid
+  listingId     String            @db.Uuid
+  tenantId      String            @db.Uuid
+  /// Denormalized at create time, as routes/applications.ts does today.
+  tenantName    String
+  message       String?
+  monthlyIncome Decimal?          @db.Decimal(12, 2)
+  /// zod bounds: 300–900.
+  creditScore   Int?
+  status        ApplicationStatus @default(REVIEWING)
+  createdAt     DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime          @updatedAt @db.Timestamptz(6)
+
+  listing Listing          @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  tenant  User             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  optIns  ScreeningOptIn[]
+  checks  ScreeningCheck[]
+  lease   Lease?
+
+  /// One LIVE application per tenant per listing is enforced by a partial unique index
+  /// (`applications_one_live_per_tenant`, WHERE status <> 'WITHDRAWN') added as raw SQL in the
+  /// init migration — Prisma cannot express a filtered unique index. Without it, two concurrent
+  /// POSTs both pass the 409 check in routes/applications.ts and insert duplicates.
+  @@index([listingId, tenantId])
+  @@index([tenantId, createdAt])
+  @@index([listingId, status])
+  @@map("applications")
+}
+
+/// Per-step tenant consent. A row's existence IS the consent; revoking deletes it, which is how
+/// PUT /applications/:id/opt-in treats null today.
+model ScreeningOptIn {
+  id            String        @id @default(uuid()) @db.Uuid
+  applicationId String        @db.Uuid
+  step          ScreeningStep
+  /// Reference contact — withheld from landlords; Rentre places the call itself.
+  contactName   String?
+  /// E.164, normalized by the zod phone transform.
+  contactPhone  String?
+  relationship  String?
+  consentedAt   DateTime      @default(now()) @db.Timestamptz(6)
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, step])
+  @@map("screening_opt_ins")
+}
+
+model ScreeningCheck {
+  id             String               @id @default(uuid()) @db.Uuid
+  applicationId  String               @db.Uuid
+  step           ScreeningStep
+  status         ScreeningCheckStatus @default(CALLING)
+  /// ElevenLabs conversation id, polled by GET /applications/:id/checks.
+  conversationId String?
+  /// Left null for reference calls — the spec forbids storing a summary, score or sentiment.
+  summary        String?
+  /// [{ role, message }]
+  transcript     Json?
+  /// Reference flow: the selected question ids, snapshotted in bank order at trigger time.
+  questions      String[]
+  /// Reference flow: [{ id, text, answer, status }] where status ∈ answered|no_answer|declined_to_answer.
+  answers        Json?
+  /// Outbound-call retry bookkeeping (no answer / voicemail → up to two retries within 48h).
+  attempts       Int                  @default(0)
+  nextRetryAt    DateTime?            @db.Timestamptz(6)
+  /// Starts the 48h deletion clock — set when a landlord first reads the results.
+  firstViewedAt  DateTime?            @db.Timestamptz(6)
+  /// Set by the purge sweeper once our copy (and the ElevenLabs conversation) have been deleted.
+  purgedAt       DateTime?            @db.Timestamptz(6)
+  createdAt      DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime             @updatedAt @db.Timestamptz(6)
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, step])
+  @@index([conversationId])
+  @@index([nextRetryAt])
+  @@index([firstViewedAt])
+  @@map("screening_checks")
+}
+
+// ─── Leases ──────────────────────────────────────────────────────────────────
+
+model Lease {
+  id            String   @id @default(uuid()) @db.Uuid
+  /// The emailed capability URL (/lease?t=…). Unguessable, so it is the access control.
+  token         String   @unique @db.Uuid
+  /// A lease starts from exactly one of two places, so both are nullable and a CHECK constraint
+  /// in the migration enforces that precisely one is set:
+  ///   applicationId — the renter applied to a listing and the landlord approved it
+  ///   passportId    — the landlord ordered lease signing from a shared passport (V4 add-on)
+  applicationId String?  @unique @db.Uuid
+  passportId    String?  @db.Uuid
+  landlordId    String   @db.Uuid
+  tenantId      String   @db.Uuid
+  /// Snapshotted so the signed document stays readable if the accounts change later.
+  tenantName    String
+  tenantEmail   String
+  address       String
+  startDate     DateTime @db.Date
+  endDate       DateTime? @db.Date
+  monthlyRent   Decimal  @db.Decimal(10, 2)
+  deposit       Decimal? @db.Decimal(10, 2)
+  terms         String
+  /// SHA-256 over the agreed content; re-checked at signing to detect tampering.
+  hash          String
+
+  landlordSignatureName String
+  landlordSignedAt      DateTime @db.Timestamptz(6)
+  landlordSignatureIp   String?
+  tenantSignatureName   String?
+  tenantSignedAt        DateTime? @db.Timestamptz(6)
+  tenantSignatureIp     String?
+  tenantSignatureUserAgent String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  application Application?    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  passport    SharedPassport? @relation(fields: [passportId], references: [id], onDelete: SetNull)
+  landlord    User            @relation("LandlordLeases", fields: [landlordId], references: [id])
+  tenant      User            @relation("TenantLeases", fields: [tenantId], references: [id])
+  revisions   LeaseRevision[]
+
+  @@index([landlordId])
+  @@index([tenantId])
+  @@index([passportId])
+  @@map("leases")
+}
+
+// ─── Tenant profile (renter passport source of truth) ────────────────────────
+
+model TenantProfile {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @unique @db.Uuid
+
+  // Basics
+  fullName String?
+  email    String?
+  phone    String?
+  city     String?
+  areas    String[]
+
+  // Preferences shown on the shared passport
+  unitType  String?
+  bedrooms  String?
+  moveIn    String?
+  budgetMin Decimal? @db.Decimal(10, 2)
+  budgetMax Decimal? @db.Decimal(10, 2)
+  leaseTerm String?
+  coApplicants Boolean @default(false)
+  /// "individual" | "co_tenants" | "co_signed". A plain string rather than a Postgres enum: the
+  /// neighbouring preference columns are strings, and the zod schema is what validates it.
+  tenancyKind String?
+  /// [{ name, email, relationship }] — everyone who would be named on the lease alongside the
+  /// renter. Json for the same reason guarantor is: it is a short list shown as-is, never queried.
+  coTenants Json?
+
+  // Employment / income (V4 shows a verified figure and its source)
+  employment        String?
+  employer          String?
+  jobTitle          String?
+  /// Self-reported.
+  income            String?
+  /// Verified by a provider — distinct from the self-reported figure above.
+  verifiedIncome    Decimal?           @db.Decimal(12, 2)
+  incomeSource      String?
+  employerDuration  String?
+  incomeVerifiedAt  DateTime?          @db.Timestamptz(6)
+  incomeStatus      VerificationStatus @default(NOT_STARTED)
+
+  // Rental history
+  currentAddress  String?
+  timeAtAddress   String?
+  currentLandlord String?
+  /// Withheld from shared passports — Rentre runs the reference call.
+  landlordPhone   String?
+
+  // Prior landlord reference (V4 ProfileDocument)
+  priorLandlord      String?
+  priorProperty      String?
+  priorRelationship  String?
+  priorContact       String?
+  confirmedTenancy   Boolean?
+  confirmedOnTime    Boolean?
+
+  // Identity
+  identityConsent    Boolean            @default(false)
+  identityStatus     VerificationStatus @default(NOT_STARTED)
+  identityMethod     String?
+  identityVerifiedAt DateTime?          @db.Timestamptz(6)
+
+  // Vendor-backed sections (Borrowell / SingleKey / KYC) — consent is stored, status is theirs
+  creditConsent      Boolean            @default(false)
+  creditStatus       VerificationStatus @default(NOT_STARTED)
+  backgroundConsent  Boolean            @default(false)
+  backgroundStatus   VerificationStatus @default(NOT_STARTED)
+  /// Screening report results surfaced in V4.
+  reportPulledAt     DateTime?          @db.Timestamptz(6)
+  paymentHistory     String?
+  ltbRecord          String?
+
+  // Consent
+  pipedaConsentAt DateTime? @db.Timestamptz(6)
+
+  /// These three are written and read as whole objects and never filtered on, so they stay JSON
+  /// rather than becoming ~15 columns. Shapes are fixed by profileSchema in server/lib/schemas.ts:
+  ///   landlordReference  { name, phone, email, from, to?, consent }
+  ///   characterReference { name, phone, email, relationship, consent }
+  ///   guarantor          { name, phone, email, relationship }
+  landlordReference  Json?
+  characterReference Json?
+  guarantor          Json?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_profiles")
+}
+
+// ─── Shared passports ────────────────────────────────────────────────────────
+
+/// A renter-generated link to a point-in-time passport snapshot.
+/// V4 made this link-based with revoke rather than email-only.
+model SharedPassport {
+  id            String @id @default(uuid()) @db.Uuid
+  token         String @unique @db.Uuid
+  ownerId       String @db.Uuid
+  /// Optional now: V4's share step no longer collects a recipient email.
+  recipientName  String?
+  recipientEmail String?
+  recipientUnit  String?
+  /// The exact snapshot that was shared — only the fields the renter ticked.
+  data          Json
+  /// Building this package was shared about, shown read-only on the landlord's gate.
+  buildingAddress String?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(6)
+  /// 14 days per the agreed default; routes/passport.ts currently uses 30.
+  expiresAt     DateTime  @db.Timestamptz(6)
+  /// Renter-initiated revoke — independent of expiry, so it is its own column.
+  revokedAt     DateTime? @db.Timestamptz(6)
+
+  owner    User             @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  accesses PassportAccess[]
+  requests AddonRequest[]
+  leases   Lease[]
+
+  @@index([ownerId, createdAt])
+  @@index([expiresAt])
+  @@map("shared_passports")
+}
+
+/// "Rentre logs all access for compliance" — one row per landlord unlock attempt.
+model PassportAccess {
+  id         String  @id @default(uuid()) @db.Uuid
+  passportId String  @db.Uuid
+  /// Set when the viewer happened to be signed in; the gate does not require an account.
+  viewerId   String? @db.Uuid
+  /// Unit the viewer claimed to represent.
+  claimedUnit String
+  proofType  OwnershipProofType
+  /// The gate currently reads only the chosen file's name — the browser never uploads the bytes —
+  /// so this is what gets logged. proofDocumentId is set instead once real uploads exist.
+  proofFileName   String?
+  proofDocumentId String? @db.Uuid
+  ipAddress  String?
+  userAgent  String?
+  verifiedAt DateTime @default(now()) @db.Timestamptz(6)
+
+  passport      SharedPassport @relation(fields: [passportId], references: [id], onDelete: Cascade)
+  viewer        User?          @relation(fields: [viewerId], references: [id], onDelete: SetNull)
+  proofDocument Document?      @relation(fields: [proofDocumentId], references: [id], onDelete: SetNull)
+
+  @@index([passportId, verifiedAt])
+  @@map("passport_accesses")
+}
+
+/// What a landlord asks for after unlocking a passport: paid services, missing documents,
+/// or a viewing slot. One row per submitted panel (V4 tracks svcSent / docSent / viewingSent).
+model AddonRequest {
+  id         String             @id @default(uuid()) @db.Uuid
+  passportId String             @db.Uuid
+  requesterId String?           @db.Uuid
+  kind       AddonRequestKind
+  status     AddonRequestStatus @default(REQUESTED)
+  claimedUnit String
+
+  /// KIND = SERVICES: which add-ons, and the custom questions for a reference call.
+  addons            ServiceAddon[]
+  referenceQuestions String[]
+
+  /// KIND = DOCUMENTS: which documents were asked for.
+  requestedDocuments DocumentKind[]
+
+  /// KIND = VIEWING: the chosen slot, as displayed ("Mon", "Sep 22", "2:00 PM").
+  viewingDay  String?
+  viewingDate String?
+  viewingTime String?
+  viewingNote String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  passport  SharedPassport @relation(fields: [passportId], references: [id], onDelete: Cascade)
+  requester User?          @relation(fields: [requesterId], references: [id], onDelete: SetNull)
+
+  @@index([passportId, kind])
+  @@index([status])
+  @@map("addon_requests")
+}
+
+// ─── Documents ───────────────────────────────────────────────────────────────
+
+/// File metadata only. Bytes live in Supabase Storage; storagePath is the object key.
+model Document {
+  id          String       @id @default(uuid()) @db.Uuid
+  ownerId     String       @db.Uuid
+  kind        DocumentKind
+  fileName    String
+  storagePath String       @unique
+  mimeType    String
+  sizeBytes   Int
+  uploadedAt  DateTime     @default(now()) @db.Timestamptz(6)
+  /// Soft delete: a document cited by a signed lease or an access log must stay referencable.
+  deletedAt   DateTime?    @db.Timestamptz(6)
+
+  owner            User             @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  passportAccesses PassportAccess[]
+
+  @@index([ownerId, kind])
+  @@index([deletedAt])
+  @@map("documents")
+}
+
+// ─── Marketing ───────────────────────────────────────────────────────────────
+
+model Lead {
+  id             String       @id @default(uuid()) @db.Uuid
+  email          String       @unique
+  intents        LeadIntent[]
+  city           String?
+  /// Calculator output the visitor asked us to save.
+  reportSnapshot Json?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(6)
+
+  @@map("leads")
+}
+
+/// A landlord-written reference question, usable in a call only after a human approves it by
+/// email. Approval is manual on purpose: a free-text question reaching a reference is a legal
+/// exposure (human-rights grounds the fixed bank deliberately avoids), so no question goes out
+/// unreviewed.
+model CustomQuestion {
+  id        String    @id @default(uuid()) @db.Uuid
+  /// Who asked for it. Only this landlord may select it.
+  ownerId   String    @db.Uuid
+  text      String
+  /// Capability token in the approve/reject link. Unguessable, so it is the access control.
+  token     String    @unique
+  /// Null = still pending. Set when the reviewer clicks approve or reject.
+  decidedAt DateTime? @db.Timestamptz(6)
+  approved  Boolean   @default(false)
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, approved])
+  @@map("custom_questions")
+}
+
+// ─── Rent roll, vacancy alerts & lease revisions ─────────────────────────────
+
+/// One unit from a landlord's uploaded rent roll. Unit numbers live here and are never exposed
+/// publicly: the platform is building-first, so only the derived price range and vacancy count
+/// leave this table. Keyed to a Listing rather than a separate Building table, because a listing
+/// is already how this codebase identifies an address.
+model RentRollEntry {
+  id           String   @id @default(uuid()) @db.Uuid
+  /// The listing that stands for the building. Soft-deleting it leaves the rent roll orphaned
+  /// rather than deleted, so a relist does not lose the history.
+  listingId    String   @db.Uuid
+  uploadedById String   @db.Uuid
+  unit         String
+  bedrooms     Int
+  /// Monthly rent in CAD, whole dollars like Listing.price.
+  rent         Decimal  @db.Decimal(10, 2)
+  /// True rows are what vacancy notifications fire on.
+  vacant       Boolean  @default(false)
+  /// When the unit is free. Matched against a renter's saved move-in window.
+  availableFrom DateTime? @db.Date
+  leaseEnd     DateTime? @db.Date
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(6)
+
+  listing    Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  uploadedBy User    @relation(fields: [uploadedById], references: [id], onDelete: Cascade)
+
+  /// Re-uploading a rent roll updates rows in place instead of duplicating the building.
+  @@unique([listingId, unit])
+  @@index([listingId, vacant])
+  @@index([uploadedById])
+  @@map("rent_roll_entries")
+}
+
+/// A renter watching a building for vacancies, with the move-in window that makes one relevant.
+model SavedBuilding {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  listingId  String    @db.Uuid
+  /// A vacancy notifies only when its availableFrom falls inside this window. Both null = any date.
+  moveInFrom DateTime? @db.Date
+  moveInTo   DateTime? @db.Date
+  createdAt  DateTime  @default(now()) @db.Timestamptz(6)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listing Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, listingId])
+  @@index([listingId])
+  @@map("saved_buildings")
+}
+
+/// An in-app notification. Email is attempted at write time; this row is what the bell reads, so
+/// a failed send still leaves the renter something to find.
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @db.Uuid
+  kind      NotificationKind
+  title     String
+  body      String
+  /// Where clicking it should go, e.g. "/listings/<id>".
+  href      String?
+  readAt    DateTime?        @db.Timestamptz(6)
+  createdAt DateTime         @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+/// A proposed change to an unsigned lease, so the two parties can negotiate terms before signing.
+///
+/// The lease row stays the single source of truth for the *current* agreed terms: accepting a
+/// revision writes its fields onto the lease and re-hashes it. A lease with no revisions is the
+/// pre-revision flow, untouched — which is why the signing route only has to check that nothing
+/// is still PROPOSED.
+model LeaseRevision {
+  id        String              @id @default(uuid()) @db.Uuid
+  leaseId   String              @db.Uuid
+  /// Monotonic per lease, so the history reads in order without relying on timestamps.
+  version   Int
+  proposedBy LeaseRevisionParty
+  status    LeaseRevisionStatus @default(PROPOSED)
+  /// The proposed terms. Same shape as the lease's own fields; only what changed is meaningful,
+  /// but all of it is stored so the history shows exactly what was on the table at each step.
+  startDate   DateTime  @db.Date
+  endDate     DateTime? @db.Date
+  monthlyRent Decimal   @db.Decimal(10, 2)
+  deposit     Decimal?  @db.Decimal(10, 2)
+  terms       String
+  /// Why, in the proposer's words. Shown verbatim to the other party.
+  note        String?
+  /// Set when the other party accepts or rejects it.
+  decidedAt   DateTime? @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+
+  lease Lease @relation(fields: [leaseId], references: [id], onDelete: Cascade)
+
+  @@unique([leaseId, version])
+  @@index([leaseId, status])
+  @@map("lease_revisions")
+}

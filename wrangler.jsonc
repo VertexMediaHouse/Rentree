@@ -1,0 +1,12 @@
+{
+  "name": "rentre",
+  "compatibility_date": "2026-08-28",
+
+  "assets": {
+    "directory": "./dist",
+    // React Router owns the URL space, so an unknown path must still serve index.html and be
+    // resolved client-side. Without this, a refresh or direct hit on any route but / returns 404.
+    // The Pages deploy path (see `deploycode`) gets the same behaviour from public/_redirects.
+    "not_found_handling": "single-page-application"
+  }
+}

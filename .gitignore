@@ -1,0 +1,8 @@
+graphify-out
+node_modules
+dist
+%APPDATA%
+Renter_V4
+server/data/db.json
+server/data/db.json.tmp
+.env
